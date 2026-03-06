@@ -7,9 +7,12 @@
   ],
   "functions": {
     "src/app/api/search/route.ts": {
-      "maxDuration": 60
+      "maxDuration": 300
     },
     "src/app/api/cron/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/export/route.ts": {
       "maxDuration": 60
     }
   }
