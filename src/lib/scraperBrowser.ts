@@ -1,7 +1,16 @@
 /**
  * scraperBrowser.ts
- * Playwright-based browser scraper for SPAs protected by WAF/TLS fingerprinting.
- * Currently handles: zakup.sk.kz (Angular SPA — blocks all non-browser HTTP clients)
+ * Playwright-based browser scraper for zakup.sk.kz
+ *
+ * Strategy:
+ *  1. Navigate directly to the search URL with keyword in query params:
+ *     https://zakup.sk.kz/#/ext?q=MAN&adst=PUBLISHED&lst=PUBLISHED&page=N
+ *  2. Intercept the Angular app's XHR/fetch API calls to capture raw JSON results
+ *     — this avoids fragile DOM scraping and gives structured data
+ *  3. For each result item, navigate to its detail URL:
+ *     https://zakup.sk.kz/#/ext(popup:item/{id}/advert)?tabs=advert&q=...
+ *     and intercept the detail API response too
+ *  4. Paginate via page=N until no more results
  *
  * Requirements:
  *  Local:  npm install playwright-core && npx playwright install chromium
@@ -12,25 +21,45 @@ import type { ScrapedItem } from './scraper';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface SkDetail {
-  title: string;
-  number: string;
-  status: string;
-  customer: string;
-  method: string;
-  amount: string;
-  startDate: string;
-  endDate: string;
+interface SkResult {
+  id: string | number;
+  number?: string;
+  nameru?: string;
+  nameRu?: string;
+  name?: string;
+  status?: string;
+  statusNameRu?: string;
+  amount?: number | string;
+  totalAmount?: number | string;
+  sumRu?: string;
+  organizerNameRu?: string;
+  customerNameRu?: string;
+  methodNameRu?: string;
+  acceptanceBeginDate?: string;
+  acceptanceEndDate?: string;
+  startDate?: string;
+  endDate?: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+interface ApiPage {
+  items?: SkResult[];
+  content?: SkResult[];
+  data?: SkResult[];
+  results?: SkResult[];
+  totalElements?: number;
+  totalPages?: number;
+  total?: number;
+  last?: boolean;
 }
 
 // ─── Browser launcher ─────────────────────────────────────────────────────────
 
 async function launchBrowser(): Promise<import('playwright-core').Browser> {
-  // playwright-core must be installed (not bundled by Next.js webpack)
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const pw = require('playwright-core') as typeof import('playwright-core');
 
-  // Serverless (Vercel / AWS Lambda) — try @sparticuz/chromium
   if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -46,14 +75,12 @@ async function launchBrowser(): Promise<import('playwright-core').Browser> {
       });
     } catch {
       throw new Error(
-        'zakup.sk.kz требует браузер. ' +
-        'На Vercel установите @sparticuz/chromium. ' +
-        'Локально запустите: npx playwright install chromium'
+        'zakup.sk.kz требует браузер. На Vercel установите @sparticuz/chromium. ' +
+        'Локально: npx playwright install chromium'
       );
     }
   }
 
-  // Local development — use installed Playwright Chromium
   return pw.chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
@@ -83,46 +110,16 @@ export async function scrapeSkZakup(
     });
 
     const page = await context.newPage();
-    page.setDefaultTimeout(30000);
+    page.setDefaultTimeout(35000);
 
-    // ── Step 1: navigate to search page ───────────────────────────────────
-    console.log('[zakup.sk.kz] Открываю страницу...');
-    await page.goto('https://zakup.sk.kz/#/ext', {
-      waitUntil: 'networkidle',
-      timeout: 40000,
-    });
-    await page.waitForTimeout(2000);
-
-    // ── Step 2: select "Закупки" tab ───────────────────────────────────────
-    await activatePurchasesTab(page);
-
-    // ── Step 3: find search input ──────────────────────────────────────────
-    const searchInput = await findSearchInput(page);
-    if (!searchInput) {
-      throw new Error('Поле поиска не найдено на zakup.sk.kz');
-    }
-
-    // ── Step 4: search for each keyword ───────────────────────────────────
     for (const keyword of keywords) {
       console.log(`[zakup.sk.kz] Поиск: "${keyword}"`);
-
       try {
-        await performSearch(page, searchInput, keyword);
-        const results = await collectResults(page, keyword, sourceUrl, name);
+        const results = await searchByKeyword(page, keyword, sourceUrl, name);
         console.log(`[zakup.sk.kz] "${keyword}" → ${results.length} объявлений`);
         allItems.push(...results);
-        await page.waitForTimeout(800);
       } catch (err) {
         console.error(`[zakup.sk.kz] Ошибка при поиске "${keyword}":`, err);
-        // Re-navigate to reset state
-        try {
-          await page.goto('https://zakup.sk.kz/#/ext', {
-            waitUntil: 'domcontentloaded',
-            timeout: 20000,
-          });
-          await page.waitForTimeout(2000);
-          await activatePurchasesTab(page);
-        } catch { /* ignore recovery error */ }
       }
     }
 
@@ -130,7 +127,7 @@ export async function scrapeSkZakup(
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error('[zakup.sk.kz] Ошибка:', msg);
+    console.error('[zakup.sk.kz]', msg);
     if (allItems.length === 0) {
       allItems.push({
         title: `${name}: ошибка при сканировании`,
@@ -148,365 +145,230 @@ export async function scrapeSkZakup(
   return allItems;
 }
 
-// ─── Activate "Закупки" tab ───────────────────────────────────────────────────
+// ─── Search one keyword across all pages ─────────────────────────────────────
 
-async function activatePurchasesTab(
-  page: import('playwright-core').Page
-): Promise<void> {
-  const selectors = [
-    'label:has-text("Закупки")',
-    'button:has-text("Закупки")',
-    '.nav-item:has-text("Закупки")',
-    '[role="tab"]:has-text("Закупки")',
-    'li:has-text("Закупки") a',
-    'li:has-text("Закупки")',
-  ];
-
-  for (const sel of selectors) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 2000 })) {
-        await el.click();
-        await page.waitForTimeout(1000);
-        return;
-      }
-    } catch { /* try next */ }
-  }
-  console.log('[zakup.sk.kz] Вкладка "Закупки" не найдена, используем текущий вид');
-}
-
-// ─── Find search input ────────────────────────────────────────────────────────
-
-async function findSearchInput(
-  page: import('playwright-core').Page
-): Promise<import('playwright-core').Locator | null> {
-  const selectors = [
-    'input[placeholder*="поиска"]',
-    'input[placeholder*="Слово для поиска"]',
-    'input[placeholder*="ключевое"]',
-    'input[placeholder*="номер закупки"]',
-    'input[type="search"]',
-    '.search-form input[type="text"]',
-    'form input[type="text"]:first-of-type',
-  ];
-
-  for (const sel of selectors) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 3000 })) {
-        console.log(`[zakup.sk.kz] Поле поиска найдено: ${sel}`);
-        return el;
-      }
-    } catch { /* try next */ }
-  }
-  return null;
-}
-
-// ─── Perform a keyword search ─────────────────────────────────────────────────
-
-async function performSearch(
-  page: import('playwright-core').Page,
-  searchInput: import('playwright-core').Locator,
-  keyword: string
-): Promise<void> {
-  // Clear and fill search input
-  await searchInput.click({ clickCount: 3 });
-  await searchInput.fill('');
-  await searchInput.type(keyword, { delay: 60 });
-  await page.waitForTimeout(400);
-
-  // Click "Найти" button
-  const btnSelectors = [
-    'button:has-text("Найти")',
-    '.btn:has-text("Найти")',
-    '[type="submit"]:has-text("Найти")',
-    'button[class*="search"]',
-    'button[class*="find"]',
-  ];
-
-  let clicked = false;
-  for (const sel of btnSelectors) {
-    try {
-      const btn = page.locator(sel).last();
-      if (await btn.isVisible({ timeout: 2000 })) {
-        await btn.click();
-        clicked = true;
-        break;
-      }
-    } catch { /* try next */ }
-  }
-
-  if (!clicked) {
-    console.warn('[zakup.sk.kz] Кнопка "Найти" не найдена, отправляю Enter');
-    await searchInput.press('Enter');
-  }
-
-  // Wait for results to load
-  await page.waitForTimeout(3000);
-
-  // Wait for spinner to disappear
-  try {
-    await page.waitForFunction(
-      () =>
-        !document.querySelector(
-          '.loading, .sk-spinner, .spinner, [class*="loader"], [class*="loading"]'
-        ),
-      { timeout: 12000 }
-    );
-  } catch { /* no spinner or timeout — proceed anyway */ }
-}
-
-// ─── Collect all results from the current search page ────────────────────────
-
-async function collectResults(
+async function searchByKeyword(
   page: import('playwright-core').Page,
   keyword: string,
   sourceUrl: string,
   sourceName: string
 ): Promise<ScrapedItem[]> {
   const items: ScrapedItem[] = [];
+  const maxPages = 10;
 
-  // Try several selectors for the result rows
-  const rowSelectors = [
-    'table tbody tr',
-    'table tr:not(:first-child)',
-    '.purchases-list .purchase-row',
-    '.results-table tbody tr',
-    '[class*="purchase"] [class*="row"]',
-    '[class*="tender"] [class*="item"]',
-    '.list-group .list-group-item',
-    '[class*="result"] li',
-  ];
+  for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+    // Direct URL navigation — Angular router reads q/adst/page params from hash
+    const searchUrl =
+      `https://zakup.sk.kz/#/ext?` +
+      `q=${encodeURIComponent(keyword)}` +
+      `&adst=PUBLISHED&lst=PUBLISHED&page=${pageNum}`;
 
-  let usedSelector = '';
-  let rowCount = 0;
+    console.log(`[zakup.sk.kz] Страница ${pageNum}: ${searchUrl}`);
 
-  for (const sel of rowSelectors) {
-    try {
-      const count = await page.locator(sel).count();
-      if (count > 0) {
-        usedSelector = sel;
-        rowCount = count;
-        console.log(`[zakup.sk.kz] Результаты (${sel}): ${count} строк`);
-        break;
-      }
-    } catch { /* try next */ }
-  }
+    // Intercept API response while navigating
+    const apiData = await navigateAndCapture(page, searchUrl);
 
-  if (rowCount === 0) {
-    const bodyText = await page.locator('body').innerText().catch(() => '');
-    const noResults =
-      /ничего не найдено|нет результатов|не найдено|нет данных/i.test(bodyText);
-    if (!noResults) {
-      console.log('[zakup.sk.kz] Не удалось определить список результатов');
+    if (!apiData) {
+      // API interception failed — fall back to DOM scraping
+      const domItems = await collectFromDom(page, keyword, pageNum, sourceUrl, sourceName);
+      items.push(...domItems);
+      if (domItems.length === 0) break;
+      continue;
     }
-    return items;
-  }
 
-  // Process each row: click → extract detail → close
-  for (let i = 0; i < rowCount; i++) {
-    try {
-      // Always re-query to avoid stale references
-      const row = page.locator(usedSelector).nth(i);
-      if (!(await row.isVisible({ timeout: 3000 }).catch(() => false))) continue;
+    const rows = apiData.items || apiData.content || apiData.data || apiData.results || [];
+    if (rows.length === 0) break;
 
-      await row.click();
-      await page.waitForTimeout(2000);
-
-      // Wait for detail panel
-      await waitForDetail(page);
-
-      // Extract data
-      const detail = await extractDetail(page);
-      const link = await getDirectLink(page, sourceUrl);
-
-      items.push({
-        title: detail.title || `Объявление №${detail.number || i + 1}`,
-        description: buildDescription(detail),
-        link,
-        matchedKeywords: [keyword],
-        sourceUrl,
-        sourceName,
-      });
-
-      // Close detail
-      await closeDetail(page);
-      await page.waitForTimeout(800);
-
-    } catch (err) {
-      console.error(`[zakup.sk.kz] Ошибка строки ${i}:`, err);
-      await closeDetail(page).catch(() => {});
-      await page.waitForTimeout(800);
+    for (const row of rows) {
+      const item = buildItemFromApi(row, keyword, pageNum, sourceUrl, sourceName);
+      items.push(item);
     }
+
+    // Check if there are more pages
+    const hasMore = checkHasMore(apiData, pageNum, rows.length);
+    if (!hasMore) break;
   }
 
   return items;
 }
 
-// ─── Wait for detail panel to open ───────────────────────────────────────────
+// ─── Navigate and intercept API response ─────────────────────────────────────
 
-async function waitForDetail(page: import('playwright-core').Page): Promise<void> {
+async function navigateAndCapture(
+  page: import('playwright-core').Page,
+  url: string
+): Promise<ApiPage | null> {
+  // Patterns that match zakup.sk.kz's procurement search endpoint
+  const apiPatterns = [
+    '4dv3rts',
+    'eprocsearch',
+    '/advert',
+    '/purchase',
+    '/search',
+    '/filter',
+    '/tenders',
+  ];
+
+  let captured: ApiPage | null = null;
+
+  // Set up response interceptor BEFORE navigating
+  const responseHandler = async (response: import('playwright-core').Response) => {
+    try {
+      const responseUrl = response.url();
+      const isApiCall = apiPatterns.some(p => responseUrl.includes(p));
+      if (!isApiCall) return;
+
+      const contentType = response.headers()['content-type'] || '';
+      if (!contentType.includes('json')) return;
+
+      const body = await response.json().catch(() => null);
+      if (!body) return;
+
+      // Accept if it looks like a list response
+      const hasItems =
+        Array.isArray(body?.items) || Array.isArray(body?.content) ||
+        Array.isArray(body?.data) || Array.isArray(body?.results);
+
+      if (hasItems) {
+        console.log(`[zakup.sk.kz] Перехвачен API ответ: ${responseUrl}`);
+        captured = body as ApiPage;
+      }
+    } catch { /* ignore */ }
+  };
+
+  page.on('response', responseHandler);
+
   try {
-    await page.waitForFunction(
-      () => {
-        const sel = '.modal, .drawer, .side-panel, dialog, [class*="detail-view"], [class*="view-detail"]';
-        const el = document.querySelector(sel) as HTMLElement | null;
-        return el !== null && el.offsetParent !== null;
-      },
-      { timeout: 8000 }
-    );
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    // Give Angular a bit more time to finish rendering
+    await page.waitForTimeout(1500);
   } catch {
     await page.waitForTimeout(2000);
+  } finally {
+    page.off('response', responseHandler);
   }
+
+  return captured;
 }
 
-// ─── Extract detail data ──────────────────────────────────────────────────────
+// ─── Build ScrapedItem from API JSON row ──────────────────────────────────────
 
-async function extractDetail(
-  page: import('playwright-core').Page
-): Promise<SkDetail> {
-  return page.evaluate((): SkDetail => {
-    // Get the panel text
-    const panel =
-      document.querySelector<HTMLElement>(
-        '.modal, .drawer, .side-panel, dialog, [class*="detail-view"]'
-      ) || document.body;
+function buildItemFromApi(
+  row: SkResult,
+  keyword: string,
+  pageNum: number,
+  sourceUrl: string,
+  sourceName: string
+): ScrapedItem {
+  const id = String(row.id || '');
+  const title =
+    String(row.nameru || row.nameRu || row.name || `Объявление №${id}`).trim();
+  const number = String(row.number || id);
+  const status = String(row.statusNameRu || row.status || '');
+  const organizer = String(row.organizerNameRu || row.customerNameRu || '');
+  const method = String(row.methodNameRu || '');
+  const rawAmount = row.totalAmount ?? row.amount ?? '';
+  const amount = rawAmount
+    ? `${parseFloat(String(rawAmount)).toLocaleString('ru-RU')} ₸`
+    : '';
+  const start = String(row.acceptanceBeginDate || row.startDate || '').split('T')[0];
+  const end = String(row.acceptanceEndDate || row.endDate || '').split('T')[0];
 
-    const text = panel.innerText || '';
+  // Canonical link to this announcement
+  const q = encodeURIComponent(keyword);
+  const link = id
+    ? `https://zakup.sk.kz/#/ext(popup:item/${id}/advert)?tabs=advert&q=${q}&adst=PUBLISHED&lst=PUBLISHED&page=${pageNum}`
+    : sourceUrl;
 
-    // Number
-    const numMatch = text.match(/№\s*(\d+)/);
-    const number = numMatch ? numMatch[1] : '';
+  const descParts = [
+    number    && `Номер: ${number}`,
+    organizer && `Заказчик: ${organizer}`,
+    method    && `Метод: ${method}`,
+    amount    && `Сумма: ${amount}`,
+    start     && `Начало: ${start}`,
+    end       && `Окончание: ${end}`,
+    status    && `Статус: ${status}`,
+  ].filter(Boolean);
 
-    // Title — find the biggest heading inside the panel
-    let title = '';
-    const headings = panel.querySelectorAll<HTMLElement>('h1, h2, h3, h4');
-    for (const h of Array.from(headings)) {
-      const t = h.innerText.trim();
-      if (t.length > 5) { title = t; break; }
-    }
-    if (!title) {
-      // Try title/subject elements
-      const titleEl = panel.querySelector<HTMLElement>(
-        '[class*="title"], [class*="subject"], [class*="name"]'
-      );
-      if (titleEl) title = titleEl.innerText.trim();
-    }
-
-    // Status badge
-    const badge = panel.querySelector<HTMLElement>(
-      '[class*="badge"], [class*="status"], [class*="label"]'
-    );
-    const status = badge ? badge.innerText.trim() : '';
-
-    // Key-value extraction from text
-    const extract = (patterns: RegExp[]): string => {
-      for (const re of patterns) {
-        const m = text.match(re);
-        if (m && m[1]) return m[1].trim();
-      }
-      return '';
-    };
-
-    const customer = extract([
-      /(?:ЗАКАЗЧИК|Заказчик)[:\s]*\n?([^\n]+)/,
-      /(?:Организатор|ОРГАНИЗАТОР)[:\s]*\n?([^\n]+)/,
-    ]);
-
-    const method = extract([
-      /(?:МЕТОД ЗАКУПКИ|Метод закупки|Способ)[:\s]*\n?([^\n]+)/i,
-    ]);
-
-    const amount = extract([
-      /(?:ОБЩАЯ СУММА ЛОТОВ|Сумма лотов|СУММА)[:\s]*\n?([\d\s,.]+[₸тгTT]+[^\n]*)/i,
-      /(?:ОБЩАЯ СУММА)[:\s]*\n?([^\n]+)/i,
-    ]);
-
-    const startDate = extract([
-      /(?:НАЧАЛО ПРИЕМА ЗАЯВОК|Начало приема)[:\s]*\n?([0-9.]+\s+[0-9:]+)/i,
-    ]);
-
-    const endDate = extract([
-      /(?:КОНЕЦ ПРИЕМА ЗАЯВОК|Конец приема|Окончание)[:\s]*\n?([0-9.]+\s+[0-9:]+)/i,
-    ]);
-
-    return { title, number, status, customer, method, amount, startDate, endDate };
-  });
+  return {
+    title: title.substring(0, 300),
+    description: descParts.join(' | ').substring(0, 1000),
+    link,
+    matchedKeywords: [keyword],
+    sourceUrl,
+    sourceName,
+  };
 }
 
-// ─── Build description string ─────────────────────────────────────────────────
+// ─── Check pagination ─────────────────────────────────────────────────────────
 
-function buildDescription(d: SkDetail): string {
-  return [
-    d.number   && `Номер: ${d.number}`,
-    d.customer && `Заказчик: ${d.customer}`,
-    d.method   && `Метод: ${d.method}`,
-    d.amount   && `Сумма: ${d.amount}`,
-    d.startDate && `Начало: ${d.startDate}`,
-    d.endDate  && `Окончание: ${d.endDate}`,
-    d.status   && `Статус: ${d.status}`,
-  ].filter(Boolean).join(' | ');
+function checkHasMore(apiData: ApiPage, currentPage: number, rowCount: number): boolean {
+  if (apiData.last === true) return false;
+  if (apiData.totalPages !== undefined && currentPage >= apiData.totalPages) return false;
+  if (rowCount === 0) return false;
+  return true;
 }
 
-// ─── Get direct link ──────────────────────────────────────────────────────────
+// ─── DOM fallback — when API interception fails ───────────────────────────────
 
-async function getDirectLink(
+async function collectFromDom(
   page: import('playwright-core').Page,
-  fallback: string
-): Promise<string> {
-  const selectors = [
-    'a:has-text("Открыть в новой вкладке")',
-    'a[target="_blank"]',
-    'a[href*="purchase"]',
-    'a[href*="tender"]',
+  keyword: string,
+  pageNum: number,
+  sourceUrl: string,
+  sourceName: string
+): Promise<ScrapedItem[]> {
+  const items: ScrapedItem[] = [];
+
+  // Wait a bit longer for Angular to render
+  await page.waitForTimeout(3000);
+
+  // Attempt to find the results table/list
+  const rowSelectors = [
+    'table tbody tr',
+    '.purchase-list-item',
+    '[class*="purchase"][class*="row"]',
+    '[class*="result"][class*="item"]',
+    '.purchases-list li',
+    '.advert-item',
+    '[class*="advert"][class*="row"]',
   ];
 
-  for (const sel of selectors) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
-        const href = await el.getAttribute('href');
-        if (href && href.length > 5) {
-          return href.startsWith('http')
-            ? href
-            : new URL(href, 'https://zakup.sk.kz').href;
-        }
-      }
-    } catch { /* try next */ }
+  let rows: import('playwright-core').Locator | null = null;
+  for (const sel of rowSelectors) {
+    const count = await page.locator(sel).count().catch(() => 0);
+    if (count > 0) { rows = page.locator(sel); break; }
   }
 
-  const url = page.url();
-  return url && url !== 'about:blank' ? url : fallback;
-}
+  if (!rows) return items;
 
-// ─── Close detail panel ───────────────────────────────────────────────────────
-
-async function closeDetail(page: import('playwright-core').Page): Promise<void> {
-  const selectors = [
-    'button[aria-label*="lose"]',
-    'button[aria-label*="акрыть"]',
-    '.modal-header .close',
-    '.btn-close',
-    '[class*="close-btn"]',
-    '[class*="closeBtn"]',
-    'button:has-text("✕")',
-    'button:has-text("×")',
-    'button:has-text("✖")',
-    'mat-icon:has-text("close")',
-    '.mat-dialog-close',
-  ];
-
-  for (const sel of selectors) {
+  const count = await rows.count();
+  for (let i = 0; i < count; i++) {
     try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 1000 }).catch(() => false)) {
-        await el.click();
-        await page.waitForTimeout(600);
-        return;
-      }
-    } catch { /* try next */ }
+      const row = rows.nth(i);
+      const text = await row.innerText().catch(() => '');
+      if (!text.trim()) continue;
+
+      // Try to find an anchor with a link
+      const anchor = row.locator('a[href*="item"]').first();
+      const href = await anchor.getAttribute('href').catch(() => null);
+      const link = href
+        ? (href.startsWith('http') ? href : `https://zakup.sk.kz/${href}`)
+        : sourceUrl;
+
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+      const title = lines[0] || `Объявление (стр. ${pageNum}, строка ${i + 1})`;
+
+      items.push({
+        title: title.substring(0, 300),
+        description: lines.slice(1, 6).join(' | ').substring(0, 1000),
+        link,
+        matchedKeywords: [keyword],
+        sourceUrl,
+        sourceName,
+      });
+    } catch { /* skip broken row */ }
   }
 
-  await page.keyboard.press('Escape');
-  await page.waitForTimeout(600);
+  return items;
 }
