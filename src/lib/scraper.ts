@@ -77,65 +77,71 @@ async function scrapeTizilim(
 ): Promise<ScrapedItem[]> {
   const apiBase = 'https://public.tizilim.gov.kz/api/public/tenders';
   const items: ScrapedItem[] = [];
-  const maxPages = 15; // ~450 recent tenders
+  const seen = new Set<string>();
+  const maxPages = 10;
 
-  for (let page = 1; page <= maxPages; page++) {
-    try {
-      const response = await fetch(`${apiBase}?page=${page}&per_page=30`, {
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        },
-        signal: AbortSignal.timeout(30000),
-      });
+  // Search per-keyword using the API's search parameter
+  for (const keyword of keywords) {
+    console.log(`[tizilim] Поиск: "${keyword}"`);
 
-      if (!response.ok) break;
+    for (let page = 1; page <= maxPages; page++) {
+      try {
+        const url =
+          `${apiBase}?page=${page}&per_page=30` +
+          `&search=${encodeURIComponent(keyword)}`;
 
-      const json: TizilimResponse = await response.json();
-      const tenders = json.data || [];
-      if (tenders.length === 0) break;
-
-      for (const tender of tenders) {
-        const searchText = [
-          tender.name_ru,
-          tender.name_kz,
-          tender.customer?.name_ru,
-          tender.type?.name_ru,
-        ]
-          .filter(Boolean)
-          .join(' ');
-
-        const matched = matchKeywords(searchText, keywords);
-        if (matched.length === 0) continue;
-
-        const link = `https://public.tizilim.gov.kz/ru/common/tender/${encodeURIComponent(
-          tender.number
-        )}`;
-
-        const descParts = [
-          tender.customer?.name_ru && `Заказчик: ${tender.customer.name_ru}`,
-          tender.type?.name_ru && `Тип: ${tender.type.name_ru}`,
-          tender.status?.name_ru && `Статус: ${tender.status.name_ru}`,
-          tender.amount &&
-            `Сумма: ${parseFloat(tender.amount).toLocaleString('ru-RU')} тг`,
-          tender.end_date && `Срок: до ${tender.end_date.split(' ')[0]}`,
-        ].filter(Boolean);
-
-        items.push({
-          title: tender.name_ru || tender.number,
-          description: descParts.join(' | '),
-          link,
-          matchedKeywords: matched,
-          sourceUrl,
-          sourceName: name,
+        const response = await fetch(url, {
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          },
+          signal: AbortSignal.timeout(30000),
         });
-      }
 
-      if (page >= (json.meta?.last_page ?? 1)) break;
-    } catch (err) {
-      console.error(`[tizilim] Page ${page} error:`, err);
-      break;
+        if (!response.ok) break;
+
+        const json: TizilimResponse = await response.json();
+        const tenders = json.data || [];
+        if (tenders.length === 0) break;
+
+        for (const tender of tenders) {
+          // Only collect published tenders (Опубликован)
+          if (tender.status?.name_ru !== 'Опубликован') continue;
+
+          // Skip duplicates
+          if (seen.has(tender.number)) continue;
+          seen.add(tender.number);
+
+          // No link — site requires login to view full tender
+          const descParts = [
+            tender.number && `№ ${tender.number}`,
+            tender.customer?.name_ru && `Заказчик: ${tender.customer.name_ru}`,
+            tender.type?.name_ru && `Тип: ${tender.type.name_ru}`,
+            tender.amount &&
+              `Сумма: ${parseFloat(tender.amount).toLocaleString('ru-RU')} тг`,
+            tender.end_date && `Срок: до ${tender.end_date.split(' ')[0]}`,
+          ].filter(Boolean);
+
+          items.push({
+            title: tender.name_ru || tender.number,
+            description: descParts.join(' | '),
+            link: sourceUrl, // link to portal main page (login required for details)
+            matchedKeywords: [keyword],
+            sourceUrl,
+            sourceName: name,
+          });
+
+          console.log(`[tizilim] ✓ ${tender.number}: ${(tender.name_ru || '').substring(0, 60)}`);
+        }
+
+        if (page >= (json.meta?.last_page ?? 1)) break;
+      } catch (err) {
+        console.error(`[tizilim] Ошибка (keyword="${keyword}", page=${page}):`, err);
+        break;
+      }
     }
+
+    console.log(`[tizilim] "${keyword}" → ${items.length} объявлений всего`);
   }
 
   return items;
