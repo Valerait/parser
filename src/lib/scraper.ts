@@ -148,7 +148,14 @@ async function scrapeTizilim(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 2. EEP MitWork — HTML scraping with URL keyword search
+// 2. EEP MitWork — HTML scraping with detail page lot data
+//
+// Strategy:
+//  1. Search via URL: filter[search]=keyword & filter[top_filter_status]=1
+//  2. Parse result rows (tr.item[data-key]) for announcement IDs + links
+//  3. Fetch each announcement detail page (/ru/publics/buy/{id})
+//  4. Collect: наименование закупки, lot details (номер, наименование, описание,
+//     количество, цена, сумма)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function scrapeEep(
@@ -159,27 +166,34 @@ async function scrapeEep(
   const items: ScrapedItem[] = [];
   const seen = new Set<string>();
   const baseUrl = 'https://eep.mitwork.kz';
-  const maxPages = 5; // up to 250 results per keyword
+  const maxPages = 5;
+
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9',
+    Referer: `${baseUrl}/ru/publics/buys`,
+  };
 
   for (const keyword of keywords) {
     console.log(`[eep.mitwork.kz] Поиск: "${keyword}"`);
 
     for (let page = 1; page <= maxPages; page++) {
       try {
+        // Correct URL params: filter[search] (not filter[keyword])
+        // filter[top_filter_status]=1 for "Опубликованные"
         const searchUrl =
           `${baseUrl}/ru/publics/buys?` +
-          `filter%5Bkeyword%5D=${encodeURIComponent(keyword)}` +
+          `filter%5Bsubmit%5D=` +
+          `&filter%5Bsearch%5D=${encodeURIComponent(keyword)}` +
+          `&filter%5Btop_filter_status%5D=1` +
+          `&filter%5Bis_preliminary%5D=EMPTY` +
           `&page=${page}&per-page=50`;
 
         const response = await fetch(searchUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9',
-            Referer: `${baseUrl}/ru/publics/buys`,
-          },
+          headers,
           signal: AbortSignal.timeout(30000),
         });
 
@@ -192,44 +206,62 @@ async function scrapeEep(
         const rows = $('tr.item[data-key]');
         if (rows.length === 0) break;
 
+        console.log(`[eep.mitwork.kz] "${keyword}" стр.${page}: ${rows.length} объявлений`);
+
+        // Collect announcement IDs and basic info from search results
+        const announcements: {
+          id: string;
+          title: string;
+          link: string;
+          amount: string;
+          method: string;
+          organizer: string;
+        }[] = [];
+
         rows.each((_, row) => {
           const $row = $(row);
           const id = $row.attr('data-key') || '';
+          if (!id || seen.has(id)) return;
+          seen.add(id);
 
-          const anchor = $row.find('td:nth-child(2) a.word-break').first();
+          const anchor = $row.find('td:nth-child(2) a').first();
           const title = anchor.text().trim();
           const href = anchor.attr('href') || `${baseUrl}/ru/publics/buy/${id}`;
           const link = href.startsWith('http') ? href : `${baseUrl}${href}`;
 
-          if (!title || seen.has(id)) return;
-          seen.add(id);
+          const amount = $row.find('td:nth-child(3)').text().trim();
+          const method = $row.find('td:nth-child(4)').text().trim();
+          const orgEl = $row.find('td:nth-child(7) a');
+          const organizer = orgEl.attr('title') || orgEl.text().trim();
 
-          const amount   = $row.find('td:nth-child(3)').text().trim();
-          const method   = $row.find('td:nth-child(4)').text().trim();
-          const start    = $row.find('td:nth-child(5)').text().trim();
-          const end      = $row.find('td:nth-child(6)').text().trim();
-          const orgEl    = $row.find('td:nth-child(7) a');
-          const organizer= orgEl.attr('title') || orgEl.text().trim();
-          const status   = $row.find('td:nth-child(8)').text().trim();
-
-          const descParts = [
-            amount    && `Сумма: ${amount}`,
-            method    && `Метод: ${method}`,
-            start     && `Начало: ${start}`,
-            end       && `Окончание: ${end}`,
-            organizer && `Организатор: ${organizer}`,
-            status    && `Статус: ${status}`,
-          ].filter(Boolean);
-
-          items.push({
-            title: title.substring(0, 300),
-            description: descParts.join(' | ').substring(0, 1000),
-            link,
-            matchedKeywords: [keyword],
-            sourceUrl,
-            sourceName: name,
-          });
+          announcements.push({ id, title, link, amount, method, organizer });
         });
+
+        // Fetch detail page for each announcement to get lot data
+        for (const ann of announcements) {
+          try {
+            const detailItems = await scrapeEepDetail(
+              ann.id, ann.title, ann.link, ann.amount, ann.method,
+              ann.organizer, keyword, sourceUrl, name, headers
+            );
+            items.push(...detailItems);
+          } catch (err) {
+            console.error(`[eep.mitwork.kz] Ошибка при загрузке объявления ${ann.id}:`, err);
+            // Fallback: add the announcement without lot details
+            items.push({
+              title: ann.title.substring(0, 300),
+              description: [
+                ann.amount && `Сумма: ${ann.amount}`,
+                ann.method && `Метод: ${ann.method}`,
+                ann.organizer && `Организатор: ${ann.organizer}`,
+              ].filter(Boolean).join(' | '),
+              link: ann.link,
+              matchedKeywords: [keyword],
+              sourceUrl,
+              sourceName: name,
+            });
+          }
+        }
 
         // Check for next page
         const hasNextPage =
@@ -242,6 +274,105 @@ async function scrapeEep(
         break;
       }
     }
+  }
+
+  console.log(`[eep.mitwork.kz] Итого: ${items.length} записей`);
+  return items;
+}
+
+// ── Fetch one EEP announcement detail page and extract lot data ──────────────
+
+async function scrapeEepDetail(
+  id: string,
+  title: string,
+  link: string,
+  amount: string,
+  method: string,
+  organizer: string,
+  keyword: string,
+  sourceUrl: string,
+  sourceName: string,
+  headers: Record<string, string>
+): Promise<ScrapedItem[]> {
+  const items: ScrapedItem[] = [];
+
+  const response = await fetch(link, {
+    headers,
+    signal: AbortSignal.timeout(30000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const $ = cheerio.load(html);
+
+  // Extract purchase name from detail page
+  const nameRu = $('table.detail-view tr')
+    .filter((_, r) => $(r).find('th').text().includes('Наименование на русском'))
+    .find('td').text().trim() || title;
+
+  // Find the lots table: it's inside a div.grid-view, with headers "Номер", "Наименование", "Количество"
+  // The main detail table has class "detail-view", so we skip it
+  let lotRows = $();
+
+  $('div.grid-view table').each((_, tbl) => {
+    const thTexts = $(tbl).find('th').map((__, th) => $(th).text().trim()).get().join(' ');
+    if (thTexts.includes('Наименование') && thTexts.includes('Количество')) {
+      lotRows = $(tbl).find('tbody tr');
+      return false; // break
+    }
+  });
+
+  if (lotRows.length > 0) {
+    console.log(`[eep.mitwork.kz] ✓ №${id}: "${nameRu.substring(0, 50)}" — ${lotRows.length} лотов`);
+
+    // Add one item per lot
+    lotRows.each((_, row) => {
+      const cells = $(row).find('td');
+      const lotNumber = cells.eq(0).text().trim();
+      const lotName = cells.eq(1).text().trim();
+      const lotDesc = cells.eq(2).text().trim();
+      const lotQty = cells.eq(3).text().trim();
+      const lotPrice = cells.eq(4).text().trim();
+      const lotTotal = cells.eq(5).text().trim();
+
+      const descParts = [
+        `Закупка: ${nameRu}`,
+        lotNumber && `Лот: ${lotNumber}`,
+        lotDesc && `Описание: ${lotDesc}`,
+        lotQty && `Кол-во: ${lotQty}`,
+        lotPrice && `Цена: ${lotPrice}`,
+        lotTotal && `Сумма: ${lotTotal}`,
+        method && `Метод: ${method}`,
+        organizer && `Организатор: ${organizer}`,
+      ].filter(Boolean);
+
+      items.push({
+        title: `${lotName || nameRu} (№${id}, лот ${lotNumber})`.substring(0, 300),
+        description: descParts.join(' | ').substring(0, 1000),
+        link,
+        matchedKeywords: [keyword],
+        sourceUrl,
+        sourceName,
+      });
+    });
+  } else {
+    // No lots table — add the announcement as a single item
+    console.log(`[eep.mitwork.kz] ✓ №${id}: "${nameRu.substring(0, 50)}" — без лотов`);
+    items.push({
+      title: `${nameRu} (№${id})`.substring(0, 300),
+      description: [
+        amount && `Сумма: ${amount}`,
+        method && `Метод: ${method}`,
+        organizer && `Организатор: ${organizer}`,
+      ].filter(Boolean).join(' | ').substring(0, 1000),
+      link,
+      matchedKeywords: [keyword],
+      sourceUrl,
+      sourceName,
+    });
   }
 
   return items;
