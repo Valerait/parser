@@ -50,7 +50,8 @@ async function setupScheduler() {
     }
 
     const [hours, minutes] = config.scheduleTime.split(':');
-    const cronExpression = `${minutes} ${hours} * * *`;
+    const daysOfWeek = config.scheduleDays || '0,1,2,3,4,5,6';
+    const cronExpression = `${minutes} ${hours} * * ${daysOfWeek}`;
 
     if (currentJob) {
       currentJob.stop();

@@ -14,7 +14,7 @@ export async function GET() {
     if (!config) {
       const { data: newConfig, error: insertError } = await supabase
         .from('AppConfig')
-        .insert({ id: 'main', scheduleTime: '09:00', scheduleEnabled: false })
+        .insert({ id: 'main', scheduleTime: '09:00', scheduleEnabled: false, scheduleDays: '1,2,3,4,5' })
         .select()
         .single();
       if (insertError) throw insertError;
@@ -30,7 +30,7 @@ export async function GET() {
 
 export async function PUT(request: Request) {
   try {
-    const { scheduleTime, scheduleEnabled } = await request.json();
+    const { scheduleTime, scheduleEnabled, scheduleDays } = await request.json();
 
     const { data, error } = await supabase
       .from('AppConfig')
@@ -38,6 +38,7 @@ export async function PUT(request: Request) {
         id: 'main',
         ...(scheduleTime !== undefined && { scheduleTime }),
         ...(scheduleEnabled !== undefined && { scheduleEnabled }),
+        ...(scheduleDays !== undefined && { scheduleDays }),
       })
       .select()
       .single();

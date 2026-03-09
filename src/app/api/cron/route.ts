@@ -15,6 +15,15 @@ export async function GET() {
       return NextResponse.json({ message: 'Scheduled search is disabled', skipped: true });
     }
 
+    // Check if today is an allowed day
+    if (config.scheduleDays) {
+      const allowedDays = config.scheduleDays.split(',').map(Number);
+      const today = new Date().getDay(); // 0=Sun, 1=Mon, ...
+      if (!allowedDays.includes(today)) {
+        return NextResponse.json({ message: `Today (day ${today}) is not in schedule`, skipped: true });
+      }
+    }
+
     const { data: sources } = await supabase
       .from('Source')
       .select('*')
