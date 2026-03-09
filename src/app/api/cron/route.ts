@@ -3,8 +3,14 @@ import { supabase } from '@/lib/supabase';
 import { scrapeSite } from '@/lib/scraper';
 
 // Vercel Cron endpoint - triggered by vercel.json cron config
-export async function GET() {
+export async function GET(request: Request) {
   try {
+    // Verify CRON_SECRET to prevent unauthorized access
+    const authHeader = request.headers.get('authorization');
+    if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const { data: config } = await supabase
       .from('AppConfig')
       .select('*')
